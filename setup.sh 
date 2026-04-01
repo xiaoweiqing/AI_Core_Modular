@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# ==============================================================================
+#      AI Core Modular - Setup v1.0
+# ==============================================================================
+# This script prepares the environment and installs all dependencies.
+# Run this once, or whenever you change requirements.txt.
+# ==============================================================================
+
+# --- Configuration ---
+PIP_MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+
+# --- Script Main Logic ---
+clear
+echo "========================================================"
+echo "    AI Core Modular - Environment Setup"
+echo "========================================================"
+echo ""
+
+# --- Step 1: Check/Create Virtual Environment ---
+echo "[1/2] Setting up virtual environment..."
+if [ ! -d "venv" ]; then
+    echo ">> Virtual environment 'venv' not found, creating it..."
+    python3 -m venv venv
+    if [ $? -ne 0 ]; then
+        echo "❌ Critical Error: Failed to create virtual environment."
+        read -p "Press any key to exit..."
+        exit 1
+    fi
+fi
+PYTHON_EXEC="venv/bin/python3"
+PIP_EXEC="venv/bin/pip"
+echo "✅ Virtual environment is ready."
+echo ""
+
+# --- Step 2: Install/Update Python Dependencies ---
+echo "[2/2] Installing/updating dependencies from requirements.txt..."
+if ! ${PIP_EXEC} install -r requirements.txt -i ${PIP_MIRROR}; then
+    echo "❌ Critical Error: Python dependency installation failed!"
+    read -p "Press any key to exit..."
+    exit 1
+fi
+echo ""
+echo "✅✅✅ Setup Complete! You can now run the application using run.sh ✅✅✅"
+read -p "Press any key to exit..."
