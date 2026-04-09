@@ -1,0 +1,32 @@
+# 核心AI与语言模型库
+langchain-openai
+sentence-transformers
+
+# 数据库相关
+qdrant-client
+
+# 热键与系统交互
+pynput
+
+# 其他辅助库
+# (下面的库如果您的旧项目还在用，可以保留)
+google-generativeai
+pyperclip
+notion-client
+google-api-python-client
+Pillow
+watchdog
+python-dotenv
+timm
+# 核心AI与语言模型库
+langchain-openai
+sentence-transformers
+
+# 数据库相关
+qdrant-client
+
+# 【【【 架构升级核心依赖 】】】
+# 用于文件信号系统，替代pynput
+watchdog
+PyMuPDF
+

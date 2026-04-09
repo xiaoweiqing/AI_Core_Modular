@@ -12,7 +12,7 @@
 # ==============================================================================
 
 # --- 1. 项目配置 ---
-PYTHON_SCRIPT_NAME="ai_ecosystem_core.py"
+PYTHON_SCRIPT_NAME="29.py"
 DB_CONTAINER_NAME="ai_database_hub"
 MODEL_REPO_URL="https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"
 MODEL_DIR="all-MiniLM-L6-v2"
