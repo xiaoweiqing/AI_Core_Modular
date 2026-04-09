@@ -1,208 +1,238 @@
-# core/ai_services.py (最终修复版 V5 - 强制代理注入 & 真正本地LLM)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-import requests 
-from typing import Optional 
+# ==============================================================================
+#      Apple FastVLM 截图深度分析工具 v1.0
+# ==============================================================================
+# 功能说明:
+# - 核心引擎: 搭载 Apple 的 FastVLM-0.5B 多模态视觉语言模型。
+# - 触发方式: 在后台监听全局热键 (Ctrl+Alt+S)，一键启动分析。
+# - 截图工具: 调用 Linux 原生的 'gnome-screenshot' 进行区域截图，稳定可靠。
+# - 深度分析: 不仅仅是OCR，更能理解图片内容、总结核心信息、提供行动洞察。
+# - 独立运行: 这是一个专门的工具，无任何外部数据库或API依赖。
+# ==============================================================================
+
 import os
-import traceback
-import asyncio
-from pathlib import Path
-from langchain_core.messages import HumanMessage
+import sys
+import threading
+import subprocess
+import time
+import uuid
 
-# 【【【 1. 导入所有正确的库，包括新增的 httpx 和 LlamaCpp 】】】
-import httpx
-from langchain_google_genai import ChatGoogleGenerativeAI
-# --- [修改] 我们不再需要 ChatOpenAI，而是需要 LlamaCpp ---
-from langchain_community.llms import LlamaCpp 
-from sentence_transformers import SentenceTransformer
-from config import settings, ACTIVE_AI_PROVIDER, CURRENT_MODEL_NAME, ACTIVE_EMBEDDING_CONFIG
-from core import state
-from utils.helpers import Colors
+# --- 尝试导入核心库，如果失败则提供清晰的指引 ---
+try:
+    import torch
+    from PIL import Image
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from pynput import keyboard
+except ImportError as e:
+    print(f"!! [严重错误] 缺少关键的Python库: {e.name}")
+    print("   -> 请确保您已经通过 'pip install -r requirements.txt' 安装了所有依赖。")
+    sys.exit(1)
 
-# ==============================================================================
-#      【【【 Master Setup & Runner (保持不变) 】】】
-# ==============================================================================
-async def setup_api():
-    if ACTIVE_AI_PROVIDER == "google":
-        return await _setup_google_api_langchain()
-    elif ACTIVE_AI_PROVIDER == "local":
-        # --- [修改] 这里现在会调用我们新的本地加载函数 ---
-        return await _setup_local_llm_direct_vulkan() 
-    else:
-        print(f"❌ {Colors.RED}[Config Error] Invalid AI Provider: '{ACTIVE_AI_PROVIDER}'{Colors.ENDC}")
-        return False
+# --- 全局配置 ---
+class Colors:
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
 
-# ==============================================================================
-#      【【【 run_ai_task 函数 (保持不变) 】】】
-#      这个函数的设计非常棒，无需任何改动就能兼容新的本地模型对象
-# ==============================================================================
-async def run_ai_task(prompt: str, provider: Optional[str] = None) -> str | None:
-    try:
-        llm_instance = None
-        target_provider = provider or ACTIVE_AI_PROVIDER
+# 定义触发截图分析的热键
+HOTKEY_COMBINATION = {keyboard.Key.ctrl, keyboard.Key.alt, keyboard.KeyCode.from_char('s')}
+current_keys = set()
 
-        if target_provider == "google":
-            llm_instance = state.llm_google
-        elif target_provider == "local":
-            llm_instance = state.llm_local
+# --- 全局变量 ---
+VLM_MODEL, VLM_TOKENIZER = None, None
 
-        if not llm_instance:
-            print(f"❌ {Colors.RED}[AI Task Error] LLM for '{target_provider}' not ready.{Colors.ENDC}")
-            return None
+# --- 应用状态控制器 ---
+class AppController:
+    def __init__(self):
+        self.is_processing = False
+        self.lock = threading.Lock()
 
-        messages = [HumanMessage(content=prompt)]
-        response = await llm_instance.ainvoke(messages)
-        
-        # --- [小修正] .content 可能不是字符串，做个安全转换 ---
-        cleaned_text = response.content.strip() if isinstance(response.content, str) else str(response)
-        
-        if "</think>" in cleaned_text: _, cleaned_text = cleaned_text.split("</think>", 1)
-        if "<|channel|>final<|message|>" in cleaned_text: _, cleaned_text = cleaned_text.split("<|channel|>final<|message|>", 1)
-        
-        return cleaned_text.strip()
-        
-    except Exception as e:
-        print(f"❌ {Colors.RED}[AI Task Error] Task failed for '{target_provider}': {e}{Colors.ENDC}")
-        traceback.print_exc()
-    return None
+app_controller = AppController()
 
 # ==============================================================================
-#      【【【 4. Google Gemini 的最终实现 (保持不变) 】】】
+# --- 核心功能模块 ---
 # ==============================================================================
-async def _setup_google_api_langchain():
-    print(f"{Colors.BLUE}>> [AI Service] Initializing Google Gemini (Back-to-Basics Proxy Mode)...{Colors.ENDC}")
-    if not settings.google_ai_key:
-        print(f"❌ {Colors.RED}[AI Error] GOOGLE_AI_KEY not found in .env.{Colors.ENDC}")
-        return False
-    try:
-        def _connect_sync():
-            proxy_url = settings.https_proxy or settings.http_proxy
-            if not proxy_url:
-                raise ValueError("Proxy URL (HTTPS_PROXY) not found in .env file, which is required for Google API mode.")
-            print(f">> [Proxy Force-Inject] Setting OS environment proxy to: {proxy_url}")
-            os.environ['HTTPS_PROXY'] = proxy_url
-            os.environ['HTTP_PROXY'] = proxy_url
-            
-            print(f">> [Google AI] Configuring with model '{settings.GOOGLE_MODEL_NAME}'...")
-            llm = ChatGoogleGenerativeAI(
-                model=settings.GOOGLE_MODEL_NAME,
-                temperature=0.7,
-                google_api_key=settings.google_ai_key,
-                request_timeout=60
-            )
-            return llm
 
-        state.llm_google = await asyncio.to_thread(_connect_sync)
-        print(f"✅ {Colors.GREEN}[AI Service] Google Gemini configured successfully! (Model: {settings.GOOGLE_MODEL_NAME}){Colors.ENDC}")
-        return True
-    except Exception as e:
-        print(f"❌ {Colors.RED}[AI Error] Failed to configure Google Gemini: {e}{Colors.ENDC}")
-        traceback.print_exc()
-        return False
-
-# ==============================================================================
-#      【【【 5. 本地 LLM 的实现 (这是唯一被替换的部分) 】】】
-# ==============================================================================
-async def _setup_local_llm_direct_vulkan():
+def setup_vlm_model():
     """
-    [MODIFIED] This function REPLACES the old _setup_local_api.
-    It directly loads the GGUF model using LlamaCpp with Vulkan acceleration,
-    making it truly offline and serverless.
+    在程序启动时加载 Apple FastVLM 多模态模型。
+    首次运行时会自动从Hugging Face下载，可能需要较长时间。
     """
-    MODEL_PATH = "/mnt/data/model/Qwen3-Coder-30B-A3B-Instruct-UD-TQ1_0.gguf"
-    
-    print(f"{Colors.BLUE}>> [AI Service] Initializing TRUE LOCAL LLM via Vulkan...{Colors.ENDC}")
-    print(f">> [AI Service] Model Path: {MODEL_PATH}")
-
+    global VLM_MODEL, VLM_TOKENIZER
     try:
-        def _load_model_sync():
-            print(">> [Proxy Cleaner] Local mode: removing any system proxy settings...")
-            for proxy_var in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
-                if proxy_var in os.environ: del os.environ[proxy_var]
-            
-            # 使用 LlamaCpp 包装器使其与 LangChain 兼容
-            llm = LlamaCpp(
-                model_path=MODEL_PATH,
-                # --- 这是您在启动脚本中设置的关键参数 ---
-                n_ctx=62144,
-                n_gpu_layers=99,      # 强制使用 Vulkan/GPU 加速
-                
-                # --- 建议的性能和采样参数 ---
-                n_batch=512,          # 提高提示处理速度
-                temperature=0.3,      # 匹配您原来的设置
-                
-                # --- 其他设置 ---
-                verbose=True,         # 在日志中确认 Vulkan 设备是否被找到
-                streaming=False,
-            )
-            return llm
+        print(f"{Colors.CYAN}>> [VLM] 正在加载 Apple's FastVLM-0.5B 模型...{Colors.RESET}")
+        print("   (首次运行会自动下载模型，根据网络情况可能需要几分钟，请耐心等待)")
+        
+        model_id = "apple/FastVLM-0.5B"
+        
+        # 自动选择设备 (GPU > CPU)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.float16 if device == "cuda" else torch.float32
+        
+        print(f">> [VLM] 检测到设备: {device.upper()}, 使用数据类型: {str(torch_dtype)}")
 
-        state.llm_local = await asyncio.to_thread(_load_model_sync)
-        print(f"✅ {Colors.GREEN}[AI Service] True Local LLM loaded and configured.{Colors.ENDC}")
+        VLM_TOKENIZER = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+        VLM_MODEL = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        ).to(device)
+        
+        print(f"{Colors.GREEN}✅ [VLM] FastVLM 模型加载成功！{Colors.RESET}")
         return True
     except Exception as e:
-        print(f"❌ {Colors.RED}[AI Error] CRITICAL - Failed to load local GGUF model: {e}{Colors.ENDC}")
-        traceback.print_exc()
+        print(f"{Colors.RED}❌ [VLM] 严重错误: 加载 FastVLM 模型失败: {e}{Colors.RESET}")
+        print("   -> 请检查您的网络连接是否可以访问 Hugging Face。")
         return False
 
-# ==============================================================================
-#      【【【 6. Embedding 模型加载 (保持不变) 】】】
-#      (您有两个同名函数，我将它们都保留下来)
-# ==============================================================================
-async def setup_embedding_model():
-    """[ASYNC] 根据 config.py 中的总开关，加载指定的本地模型。"""
+def capture_screen_area():
+    """
+    调用 gnome-screenshot 进行区域截图，返回一个 PIL.Image 对象或 None。
+    """
     try:
-        model_path = ACTIVE_EMBEDDING_CONFIG["path"]
-        if not Path(model_path).is_dir():
-            print(f"❌ {Colors.RED}[Embedding Error] Model folder not found at '{model_path}'!{Colors.ENDC}")
-            return False
-
-        print(f">> [Async Embedding] Loading model '{CURRENT_MODEL_NAME}' from: '{model_path}'...")
-        state.EMBEDDING_MODEL = await asyncio.to_thread(SentenceTransformer, model_path)
-        print(f"✅ {Colors.GREEN}[Async Embedding] Model '{CURRENT_MODEL_NAME}' is ready.{Colors.ENDC}")
-        return True
+        temp_file_path = f"/tmp/fastvlm_screenshot_{uuid.uuid4()}.png"
+        subprocess.run(['gnome-screenshot', '-a', '-f', temp_file_path], check=True)
+        
+        if os.path.exists(temp_file_path):
+            with Image.open(temp_file_path) as img:
+                img_copy = img.copy()
+            os.remove(temp_file_path)
+            return img_copy
+        return None
+    except FileNotFoundError:
+        print(f"{Colors.RED}!! [截图工具] 错误: 'gnome-screenshot' 命令未找到。{Colors.RESET}")
+        return None
+    except subprocess.CalledProcessError:
+        print(f"{Colors.YELLOW}>> [截图工具] 截图操作已取消。{Colors.RESET}")
+        return None
     except Exception as e:
-        print(f"❌ {Colors.RED}[Async Embedding Error] Failed to load local model: {e}{Colors.ENDC}")
-        return False
-
-async def generate_text_vector(text: str) -> list[float] | None:
-    """[ASYNC] 生成文本的向量嵌入。"""
-    try:
-        if not state.EMBEDDING_MODEL:
-            print(f"{Colors.RED}[Async Embedding Error] Embedding model not initialized.{Colors.ENDC}")
-            return None
-        full_vector = await asyncio.to_thread(state.EMBEDDING_MODEL.encode, text)
-        return full_vector.tolist()
-    except Exception as e:
-        print(f"❌ {Colors.RED}[Async Embedding Error] Failed to encode text: {e}{Colors.ENDC}")
-        traceback.print_exc()
+        print(f"{Colors.RED}!! [截图工具] 截图时发生未知错误: {e}{Colors.RESET}")
         return None
 
+def analyze_screenshot_with_fastvlm(img: Image.Image):
+    """
+    使用加载的 FastVLM 模型对 PIL 图像进行深度分析。
+    """
+    with app_controller.lock:
+        app_controller.is_processing = True
+
+    try:
+        print(f"\n{Colors.CYAN}>> [FastVLM] 收到截图，开始进行深度分析...{Colors.RESET}")
+        
+        # --- 改造自 v16.0 的强大分析 Prompt ---
+        vlm_prompt_text = (
+            "<image>\n"
+            "# 角色: 全能视觉分析与策略洞察专家\n"
+            "# 核心任务: 接收一张截图，从多个维度进行深度分析，并输出你的洞察。\n"
+            "# 分析维度:\n"
+            "1. **文本提取**: 提取图片中所有清晰可读的中文和英文文本。\n"
+            "2. **核心摘要**: 综合图片内容和文本，用一句话总结截图的核心信息。\n"
+            "3. **行动洞察**: 这是最重要的部分。发掘出潜在的机会、风险、优化点或下一步可以采取的具体行动。\n"
+            "# 请开始你的分析:"
+        )
+        
+        # --- FastVLM 推理逻辑 (源自 v27.0) ---
+        tok = VLM_TOKENIZER
+        model = VLM_MODEL
+        IMAGE_TOKEN_INDEX = -200
+        
+        messages = [{"role": "user", "content": vlm_prompt_text}]
+        rendered = tok.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        pre, post = rendered.split("<image>", 1)
+        
+        input_ids = torch.cat([
+            tok(pre, return_tensors="pt", add_special_tokens=False).input_ids,
+            torch.tensor([[IMAGE_TOKEN_INDEX]], dtype=torch.long),
+            tok(post, return_tensors="pt", add_special_tokens=False).input_ids
+        ], dim=1).to(model.device)
+        
+        px = model.get_vision_tower().image_processor(images=img.convert("RGB"), return_tensors="pt")["pixel_values"]
+        px = px.to(model.device, dtype=model.dtype)
+        
+        with torch.no_grad():
+            out = model.generate(
+                inputs=input_ids,
+                images=px,
+                max_new_tokens=2048,
+                do_sample=False, # 使用确定性解码
+            )
+        
+        # 清理和格式化输出
+        response_text = tok.decode(out[0], skip_special_tokens=True)
+        # 找到prompt的结束位置，只取之后的内容
+        clean_response = response_text.split("请开始你的分析:")[-1].strip()
+        
+        print("\n" + "="*25 + f" {Colors.BOLD}{Colors.MAGENTA}Apple FastVLM 分析结果{Colors.RESET} " + "="*25)
+        print(clean_response)
+        print("="*78 + "\n")
+        print(f"{Colors.YELLOW}>> 分析完成。再次按下 {Colors.BOLD}Ctrl+Alt+S{Colors.RESET}{Colors.YELLOW} 可进行新的分析。{Colors.RESET}")
+
+    except Exception as e:
+        print(f"{Colors.RED}!! [FastVLM 分析] AI处理时出错: {e}{Colors.RESET}")
+    finally:
+        with app_controller.lock:
+            app_controller.is_processing = False
+
+def trigger_analysis():
+    """
+    由热键调用的主流程函数。
+    """
+    if app_controller.is_processing:
+        print(f"{Colors.YELLOW}!! [系统] 正忙，请等待上一个分析任务完成。{Colors.RESET}")
+        return
+
+    print(f"\n{Colors.GREEN}>> [热键触发] 请用鼠标拖拽选择截图区域 (按Esc可取消)...{Colors.RESET}")
+    
+    # 截图操作可能会阻塞，但这是预期的行为
+    captured_image = capture_screen_area()
+    
+    if captured_image:
+        # 在新线程中运行分析，以防万一有任何阻塞，不影响键盘监听器
+        analysis_thread = threading.Thread(target=analyze_screenshot_with_fastvlm, args=(captured_image,), daemon=True)
+        analysis_thread.start()
+
+# --- 热键监听器回调 ---
+def on_press(key):
+    if key in HOTKEY_COMBINATION:
+        current_keys.add(key)
+        if all(k in current_keys for k in HOTKEY_COMBINATION):
+            trigger_analysis()
+
+def on_release(key):
+    try:
+        current_keys.remove(key)
+    except KeyError:
+        pass
+
 # ==============================================================================
-#      【【【 NEW: Google Search API Service (保持不变) 】】】
+# --- 主程序入口 ---
 # ==============================================================================
-async def google_search_task(query: str) -> str:
-    print("   -> [API Call] Performing Google Search...")
-    api_key = settings.google_search_api_key
-    cx = settings.google_search_cx
-    if not api_key or not cx:
-        return "Error: Google Search API Key or CX is not configured in .env file."
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {'key': api_key, 'cx': cx, 'q': query, 'num': 5}
-    def _sync_search():
+if __name__ == "__main__":
+    os.system('cls' if os.name == 'nt' else 'clear')
+    print("=" * 70)
+    print(f"  {Colors.BOLD}Apple FastVLM 截图深度分析工具 v1.0{Colors.RESET}")
+    print("=" * 70)
+    
+    if not setup_vlm_model():
+        input("核心模型初始化失败，程序无法启动。请检查错误信息后重试。按回车退出。")
+        sys.exit(1)
+    
+    print("\n" + "=" * 70)
+    print(f"  {Colors.GREEN}[系统就绪] 后台服务已启动，正在监听热键...{Colors.RESET}")
+    print(f"  - {Colors.BOLD}按下 Ctrl + Alt + S{Colors.RESET} 即可开始截图分析。")
+    print(f"  - 在终端窗口按下 {Colors.BOLD}Ctrl + C{Colors.RESET} 即可安全退出程序。")
+    print("=" * 70 + "\n")
+    
+    # 启动热键监听器
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         try:
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            search_results = response.json()
-            if "items" not in search_results:
-                return "No search results found."
-            formatted_context = ""
-            for i, item in enumerate(search_results["items"]):
-                title = item.get('title', 'No Title')
-                snippet = item.get('snippet', 'No Snippet').replace('\n', ' ')
-                formatted_context += f"Result [{i+1}]: {title}\nSnippet: {snippet}\n\n"
-            return formatted_context
-        except requests.exceptions.RequestException as e:
-            return f"Error: Failed to connect to Google Search API. Details: {e}"
-        except Exception as e:
-            return f"Error: An unexpected error occurred during the search. Details: {e}"
-    return await asyncio.to_thread(_sync_search)
+            listener.join()
+        except KeyboardInterrupt:
+            print("\n>> [系统] 收到退出指令，正在关闭...")
+            print(">> [系统] 已安全退出。")

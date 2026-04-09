@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 # ===================================================================================
-#      灵感记忆系统 (MuseBox) v1.0 - by [Your Name]
+#      灵感记忆系统 (MuseBox) v2.3 - 纯异步修复版
 # ===================================================================================
 # 功能:
-# - 全局热键触发，随时捕捉剪贴板灵感。
-# - AI 驱动，自动对内容进行分类、摘要和结构化信息提取。
-# - 原文与AI精炼数据双重存储到本地 SQLite 数据库。
-# - 自动生成结构清晰的 Markdown 笔记，便于回顾。
-# - 内容向量化，为未来的语义搜索构建知识库。
+# - 【【【 v2.3 核心修复: 重构为纯异步架构，解决AI调用卡死问题 】】】
+# - 移除了 threading 和 watchdog，避免了事件循环冲突。
+# - 采用 asyncio.sleep 轮询文件作为触发器，稳定可靠。
+# - 实现了“秒存模式”，用户体验零延迟。
+# - 增加了AI请求的超时与容错处理，防止后台任务假死。
 # ===================================================================================
 
 import os
@@ -17,11 +17,8 @@ import sys
 import json
 import sqlite3
 import re
-import time
-import subprocess
-import hashlib
 import asyncio
-import threading
+import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -29,7 +26,6 @@ from pathlib import Path
 from langchain_openai import ChatOpenAI
 from qdrant_client import QdrantClient, models
 from sentence_transformers import SentenceTransformer
-from pynput import keyboard  # 用于监听全局热键
 
 # --- 代理与离线模式设置 ---
 for proxy_var in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY']:
@@ -40,12 +36,8 @@ os.environ['HF_HUB_OFFLINE'] = '1'
 # ==============================================================================
 # 0. 用户配置区
 # ==============================================================================
-# --- 快捷键配置 ---
-# 您可以改成 keyboard.Key.f12, f10 等。注意：有些F键可能被系统占用。
-CAPTURE_HOTKEY = keyboard.Key.f11
-
-# --- 存储路径配置 ---
-# 所有数据和笔记都会保存在这个文件夹里
+IPC_DIR = Path.home() / ".musebox_ipc"
+TRIGGER_FILE = IPC_DIR / "capture_inspiration"
 STORAGE_DIR = Path.home() / "MuseBox_Storage"
 DB_FILE = STORAGE_DIR / "musebox_memory.db"
 MARKDOWN_NOTES_DIR = STORAGE_DIR / "灵感笔记"
@@ -56,7 +48,6 @@ QDRANT_CLIENT = None
 EMBEDDING_MODEL = None
 IS_RAG_ENABLED = False
 QDRANT_COLLECTION_NAME = "musebox_inspirations_v1"
-WORKER_COUNT = 1  # 灵感捕捉不需要高并发，1个工人足以保证稳定
 
 # ==============================================================================
 # 1. 核心AI指令 (Prompt)
@@ -78,7 +69,7 @@ MUSE_PROCESSOR_PROMPT = """
 
 # 输入材料
 【原始文本】
-{raw_text}
+__RAW_TEXT__
 
 # 输出格式 (严格遵循此JSON结构，不要输出任何额外文字)
 ```json
@@ -90,13 +81,11 @@ MUSE_PROCESSOR_PROMPT = """
   "structured_data": {{}}
 }}
 """
-
 # ==============================================================================
 # 2. 系统设置与辅助函数
 # ==============================================================================
 def setup_systems():
-    """统一初始化所有外部系统（数据库，AI模型等）。"""
-    print("="*10 + " 灵感记忆系统 (MuseBox) v1.0 正在启动 " + "="*10)
+    print("="*10 + " 灵感记忆系统 (MuseBox) v2.3 正在启动 " + "="*10)
     STORAGE_DIR.mkdir(exist_ok=True)
     MARKDOWN_NOTES_DIR.mkdir(exist_ok=True)
     if not (setup_local_database() and setup_local_llm() and setup_qdrant_and_embedding()):
@@ -131,25 +120,22 @@ def setup_local_database():
 def setup_qdrant_and_embedding():
     global QDRANT_CLIENT, EMBEDDING_MODEL, IS_RAG_ENABLED
     try:
-        local_model_path = Path(__file__).parent / 'all-MiniLM-L6-v2'
+        # 修正: Path(__file__) 在某些打包情况下会失效，用更通用的方式
+        current_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        local_model_path = current_dir / 'all-MiniLM-L6-v2'
+        
         print(f">> [向量] 正在从本地路径加载 embedding 模型: {local_model_path}")
         if not local_model_path.is_dir():
             print(f"❌ [向量] 严重错误: 模型文件夹不存在！ '{local_model_path}'")
             return False
         EMBEDDING_MODEL = SentenceTransformer(str(local_model_path))
         vector_size = EMBEDDING_MODEL.get_sentence_embedding_dimension()
-        
         print(">> [向量] 正在连接到向量数据库 (localhost:6333)...")
         QDRANT_CLIENT = QdrantClient(host="localhost", port=6333)
-        
         collections = [c.name for c in QDRANT_CLIENT.get_collections().collections]
         if QDRANT_COLLECTION_NAME not in collections:
             print(f">> [向量] 集合 '{QDRANT_COLLECTION_NAME}' 不存在，正在创建...")
-            QDRANT_CLIENT.recreate_collection(
-                collection_name=QDRANT_COLLECTION_NAME,
-                vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE)
-            )
-        
+            QDRANT_CLIENT.recreate_collection(collection_name=QDRANT_COLLECTION_NAME, vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE))
         count = QDRANT_CLIENT.count(collection_name=QDRANT_COLLECTION_NAME, exact=True).count
         print(f"✅ [向量] 成功连接！当前灵感库中有 {count} 个向量记忆。")
         IS_RAG_ENABLED = True
@@ -158,219 +144,191 @@ def setup_qdrant_and_embedding():
         print(f"❌ [向量] 严重错误: 无法连接或设置 Qdrant: {e}")
         IS_RAG_ENABLED = False
         return False
-
+        
 def setup_local_llm():
     global llm
     try:
         print(f">> [AI] 正在连接到本地模型 API at [http://127.0.0.1:8087/v1]...")
-        llm = ChatOpenAI(
-            openai_api_base="http://127.0.0.1:8087/v1", openai_api_key="na",
-            model_name="local", temperature=0.2, max_tokens=4096, request_timeout=300
-        )
+        llm = ChatOpenAI(openai_api_base="http://127.0.0.1:8087/v1", openai_api_key="na", model_name="local", temperature=0.2, max_tokens=4096, request_timeout=120, max_retries=1)
         llm.invoke("Hi")
         print(f"✅ [AI] 本地大语言模型连接成功。")
         return True
     except Exception as e:
         print(f"❌ [AI] 严重错误: 连接本地模型失败: {e}")
+        print("   -> 请确保您的本地AI模型服务 (如Ollama) 正在运行。")
         return False
 
-def get_content_hash(text):
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+def get_content_hash(text): return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 def clean_json_response(text: str) -> str:
-    match = re.search(r"json\s*(.*?)\s*", text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    # 备用方案，找到第一个 { 和最后一个 }
+    match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
+    if match: return match.group(1).strip()
     start = text.find('{')
     end = text.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        return text[start:end+1]
+    if start != -1 and end != -1 and end > start: return text[start:end+1]
     return "{}"
 
 # ==============================================================================
 # 3. 核心处理流程
 # ==============================================================================
-async def process_inspiration_text(raw_text):
-    """完整的灵感处理流水线"""
-    print("\n" + "-"*20 + f" 🔥 新灵感捕捉 [{datetime.now().strftime('%H:%M:%S')}] " + "-"*20)
-    # 1. 检查内容是否重复
+def instant_save_raw_text(raw_text):
     text_hash = get_content_hash(raw_text)
-    with sqlite3.connect(DB_FILE) as conn:
-        if conn.execute("SELECT id FROM inspirations WHERE text_hash = ?", (text_hash,)).fetchone():
-            print(">> [去重] 这条灵感已经存在于记忆库中，已跳过。")
-            return
-
-    # 2. AI进行分析和提取
-    print(">> [AI分析] 正在请求AI对内容进行解析和结构化...")
-    prompt = MUSE_PROCESSOR_PROMPT.format(raw_text=raw_text)
     try:
-        response_text = await llm.ainvoke(prompt)
+        with sqlite3.connect(DB_FILE) as conn:
+            if conn.execute("SELECT id FROM inspirations WHERE text_hash = ?", (text_hash,)).fetchone():
+                print(">> [去重] 这条灵感已存在，跳过。")
+                return None
+            params = (datetime.now(timezone(timedelta(hours=8))).isoformat(), raw_text, text_hash, "处理中...", "处理中...")
+            cursor = conn.execute("INSERT INTO inspirations (capture_time, raw_text, text_hash, title, summary) VALUES (?, ?, ?, ?, ?)", params)
+            conn.commit()
+            print(f"✅ 灵感已秒存！数据库ID: {cursor.lastrowid}，后台处理中...")
+            return cursor.lastrowid
+    except Exception as e:
+        print(f"!! [秒存] 写入数据库时发生初始错误: {e}")
+        return None
+
+async def process_and_update_in_background(db_id, raw_text):
+    print(f"   -> [后台处理] 正在为 ID:{db_id} 的灵感请求AI分析...")
+    prompt = MUSE_PROCESSOR_PROMPT.replace("__RAW_TEXT__", raw_text)
+    ai_data = None
+    # ... 函数余下部分``
+    try:
+        response_text = await asyncio.wait_for(llm.ainvoke(prompt), timeout=300.0)
         ai_json_str = clean_json_response(response_text.content)
         ai_data = json.loads(ai_json_str)
-        print("✅ [AI分析] 成功提取结构化信息！")
+        print(f"   -> [后台处理] AI分析完成: “{ai_data.get('title')}”")
+    except asyncio.TimeoutError:
+        print(f"   !! [后台处理] 严重错误: AI模型在5分钟内未响应 (Timeout)！ID:{db_id} 的分析任务已中断。")
     except Exception as e:
-        print(f"!! [AI分析] AI处理失败: {e}。将仅保存原文。")
-        ai_data = {
-            "title": raw_text[:20] + "...", "content_type": "未分类",
-            "tags": [], "summary": "AI分析失败，请手动整理。", "structured_data": {}
-        }
+        print(f"   !! [后台处理] AI分析失败: {e}。")
+    
+    if ai_data is None:
+        ai_data = {"title": raw_text[:20] + "...", "content_type": "未分类", "tags": [], "summary": "错误：AI分析失败或超时", "structured_data": {}}
 
-    # 3. 生成 Markdown 笔记文件
-    print(">> [笔记生成] 正在创建清晰的 Markdown 笔记...")
-    md_path = create_markdown_note(raw_text, ai_data)
-    print(f"✅ [笔记生成] 笔记已保存到: {md_path.name}")
+    # 在异步函数中调用同步IO操作，使用 run_in_executor
+    loop = asyncio.get_running_loop()
+    md_path = await loop.run_in_executor(None, create_markdown_note, raw_text, ai_data)
+    print(f"   -> [后台处理] Markdown笔记已创建: {md_path.name}")
+    
+    await loop.run_in_executor(None, update_database_record, db_id, ai_data, md_path)
+    
+    await vectorize_inspiration(db_id, raw_text, ai_data)
 
-    # 4. 保存到 SQLite 数据库
-    print(">> [数据库] 正在将所有信息存入本地记忆库...")
-    db_id = save_to_sqlite(raw_text, text_hash, ai_data, str(md_path))
-    if db_id:
-        print(f"✅ [数据库] 灵感已成功存档！数据库ID: {db_id}")
-        # 5. 异步进行向量化
-        asyncio.create_task(vectorize_inspiration(db_id, raw_text, ai_data))
-
-    print("-" * (62 + len(datetime.now().strftime('%H:%M:%S'))))
+def update_database_record(db_id, ai_data, md_path):
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            params = (ai_data.get("title"), ai_data.get("content_type"), json.dumps(ai_data.get("tags"), ensure_ascii=False), ai_data.get("summary"), json.dumps(ai_data.get("structured_data"), ensure_ascii=False, indent=2), str(md_path), db_id)
+            conn.execute("UPDATE inspirations SET title=?, content_type=?, tags=?, summary=?, structured_data_json=?, markdown_path=? WHERE id=?", params)
+            conn.commit()
+        print(f"   -> [后台处理] 数据库记录 ID:{db_id} 已更新。")
+    except Exception as e:
+        print(f"   !! [后台处理] 更新数据库时出错: {e}")
 
 def create_markdown_note(raw_text, ai_data):
-    """根据AI分析结果，生成一个结构化的Markdown文件"""
     title = ai_data.get("title", "未命名灵感")
-    # 清理文件名中的非法字符
     safe_filename = re.sub(r'[\/*?:"<>|]', "", title)
     filename = f"{datetime.now().strftime('%Y-%m-%d_%H%M%S')}_{safe_filename}.md"
     filepath = MARKDOWN_NOTES_DIR / filename
     tags_str = ' '.join([f'`{tag}`' for tag in ai_data.get("tags", [])])
-
-    content = f"""# {title}
-类型: {ai_data.get("content_type", "N/A")}
-标签: {tags_str}
-捕获时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-核心摘要
-{ai_data.get("summary", "N/A")}
-结构化信息
-{json.dumps(ai_data.get("structured_data", {}), indent=2, ensure_ascii=False)}
-原始文本
-{raw_text}
-"""
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
+    content = f"""# {title}\n类型: {ai_data.get("content_type", "N/A")}\n标签: {tags_str}\n捕获时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n## 核心摘要\n{ai_data.get("summary", "N/A")}\n\n## 结构化信息\n```json\n{json.dumps(ai_data.get("structured_data", {}), indent=2, ensure_ascii=False)}\n```\n\n## 原始文本\n---\n{raw_text}\n"""
+    with open(filepath, 'w', encoding='utf-8') as f: f.write(content)
     return filepath
 
-def save_to_sqlite(raw_text, text_hash, ai_data, md_path):
-    """将所有数据保存到SQLite"""
-    try:
-        with sqlite3.connect(DB_FILE) as conn:
-            params = (
-                datetime.now(timezone(timedelta(hours=8))).isoformat(),
-                ai_data.get("title"),
-                ai_data.get("content_type"),
-                json.dumps(ai_data.get("tags"), ensure_ascii=False),
-                ai_data.get("summary"),
-                json.dumps(ai_data.get("structured_data"), ensure_ascii=False, indent=2),
-                raw_text,
-                text_hash,
-                md_path
-            )
-            cursor = conn.execute("""
-            INSERT INTO inspirations (capture_time, title, content_type, tags, summary,
-            structured_data_json, raw_text, text_hash, markdown_path)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, params)
-            return cursor.lastrowid
-    except sqlite3.IntegrityError:  # 捕获UNIQUE约束失败的错误
-        return None  # 表示是重复的
-    except Exception as e:
-        print(f"!! [数据库] 写入SQLite时出错: {e}")
-        return None
-
 async def vectorize_inspiration(db_id, raw_text, ai_data):
-    """将灵感内容向量化并存入Qdrant"""
-    if not IS_RAG_ENABLED:
-        return
-    print(f"   -> [后台向量化] 正在为 '{ai_data.get('title')}' 创建向量记忆...")
+    if not IS_RAG_ENABLED: return
+    print(f"   -> [后台向量化] 正在为 ID:{db_id} 创建向量记忆...")
     try:
-        # 我们向量化“摘要 + 原文”，这样搜索时能兼顾核心思想和细节
         text_to_embed = f"摘要: {ai_data.get('summary')}\n\n原文: {raw_text}"
-        
         loop = asyncio.get_running_loop()
         vector = await loop.run_in_executor(None, EMBEDDING_MODEL.encode, text_to_embed)
-        
         payload = {"db_id": db_id, "title": ai_data.get("title"), "summary": ai_data.get("summary")}
-        
-        await loop.run_in_executor(None, lambda: QDRANT_CLIENT.upsert(
-            collection_name=QDRANT_COLLECTION_NAME,
-            points=[models.PointStruct(id=db_id, vector=vector.tolist(), payload=payload)],
-            wait=True
-        ))
-        print(f"   ✅ [后台向量化] 向量记忆创建成功！")
+        await loop.run_in_executor(None, lambda: QDRANT_CLIENT.upsert(collection_name=QDRANT_COLLECTION_NAME, points=[models.PointStruct(id=db_id, vector=vector.tolist(), payload=payload)], wait=True))
+        print(f"   ✅ [后台处理] ID:{db_id} 全部流程处理完毕。")
     except Exception as e:
         print(f"   !! [后台向量化] 向量化时出错: {e}")
 
 # ==============================================================================
-# 4. 全局热键监听与主程序
+# 4. 主程序、信号处理与启动流程 (纯异步重构)
 # ==============================================================================
-is_processing_hotkey = False
-
-def on_hotkey_press():
-    """热键被按下时触发的函数"""
-    global is_processing_hotkey
-    if is_processing_hotkey:
-        print("\n>> [系统] 正在处理上一个灵感，请稍候...")
-        return
-    is_processing_hotkey = True
+async def trigger_capture_task():
+    """
+    这是一个异步版本的任务触发器
+    """
+    print(f"\n>> [信号] 收到任务信号: {TRIGGER_FILE.name}")
     try:
-        # 使用 pyperclip 获取剪贴板内容
-        clipboard_content = subprocess.check_output(['xclip', '-o', '-selection', 'clipboard'], text=True)
+        # 使用异步方式执行xclip，防止阻塞事件循环
+        process = await asyncio.create_subprocess_exec(
+            'xclip', '-o', '-selection', 'clipboard',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            raise FileNotFoundError(f"xclip 执行失败: {stderr.decode()}")
+
+        clipboard_content = stdout.decode('utf-8')
+        
         if clipboard_content and not clipboard_content.isspace():
-            # 在事件循环中安全地运行异步任务
-            asyncio.run_coroutine_threadsafe(process_inspiration_text(clipboard_content), asyncio.get_event_loop())
+            # 用 run_in_executor 包装同步的数据库操作
+            loop = asyncio.get_running_loop()
+            db_id = await loop.run_in_executor(None, instant_save_raw_text, clipboard_content)
+            
+            if db_id:
+                # 创建一个后台任务来处理，这样主监控循环不会被长时间处理阻塞
+                asyncio.create_task(process_and_update_in_background(db_id, clipboard_content))
         else:
             print("\n>> [系统] 剪贴板内容为空，已忽略。")
+            
     except FileNotFoundError:
-        print("\n!! [错误] 未找到 'xclip' 工具。请在您的Linux系统上安装它 (例如: sudo dnf install xclip)")
+        print("\n!! [错误] 未找到 'xclip' 工具。请确保已安装 (sudo dnf install xclip)。")
     except Exception as e:
         print(f"\n!! [错误] 捕捉灵感时发生未知错误: {e}")
-    finally:
-        # 短暂延迟后释放锁，防止快速连按
-        time.sleep(1)
-        is_processing_hotkey = False
 
-def main_sync():
-    """同步的主函数，用于设置和运行事件循环及热键监听器"""
-    if not setup_systems():
-        return
-    # 获取或创建事件循环
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+async def watch_for_trigger():
+    """
+    一个简单的异步文件监视器
+    """
+    IPC_DIR.mkdir(exist_ok=True)
+    if TRIGGER_FILE.exists():
+        TRIGGER_FILE.unlink()
+        
+    print(f">> [监控中] 正在监控触发文件: {TRIGGER_FILE}")
+    while True:
+        try:
+            if TRIGGER_FILE.exists():
+                # 使用 create_task 确保即使 trigger_capture_task 内部有耗时操作,
+                # 文件清理也能尽快执行, 不会影响下一次触发。
+                asyncio.create_task(trigger_capture_task())
+                # 等待一小段时间让任务开始执行，然后清理文件
+                await asyncio.sleep(0.2)
+                if TRIGGER_FILE.exists():
+                    TRIGGER_FILE.unlink()
+            await asyncio.sleep(0.5) # 每0.5秒检查一次
+        except Exception as e:
+            print(f"!! [监控循环] 发生错误: {e}")
+            await asyncio.sleep(5) # 出错时等待长一点时间
 
-    # 在单独的线程中运行事件循环
-    def run_loop(loop):
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
+async def main_async():
+    if not setup_systems(): return
 
-    thread = threading.Thread(target=run_loop, args=(loop,), daemon=True)
-    thread.start()
-
+    full_trigger_path = TRIGGER_FILE.resolve()
     print("\n" + "="*70)
-    print("  ✅ [系统就绪] 灵感记忆系统已启动！")
-    print(f"  请按【{str(CAPTURE_HOTKEY).split('.')[-1].upper()}】键随时捕捉剪贴板中的灵感。")
-    print("  按 Ctrl+C 即可安全退出程序。")
+    print("  ✅ [系统就绪] MuseBox 后台服务已启动 (纯异步修复版 v2.3)")
+    print("  请在您的系统设置中，将喜欢的快捷键绑定到下面的【完整命令】：")
+    print(f"\n    touch {full_trigger_path}\n")
+    print("\n  按 Ctrl+C 即可安全退出程序。")
     print("="*70)
-
-    # 设置热键监听器
-    listener = keyboard.Listener(on_press=lambda key: on_hotkey_press() if key == CAPTURE_HOTKEY else None)
-    listener.start()
-
+    
     try:
-        listener.join()
-    except KeyboardInterrupt:
+        await watch_for_trigger()
+    except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n>> [系统] 收到退出指令，正在关闭...")
     finally:
-        listener.stop()
-        loop.call_soon_threadsafe(loop.stop)
         print(">> [系统] 已安全退出。")
 
 if __name__ == "__main__":
-    main_sync()
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
